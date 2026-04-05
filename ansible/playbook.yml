@@ -1,0 +1,272 @@
+---
+- name: Deploy Node.js app on EC2
+  hosts: all
+  become: yes
+  vars:
+    app_dir: /opt/app
+    app_port: 3000
+    node_version: "18"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install Node.js 18.x via NodeSource
+      shell: |
+        curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+        apt-get install -y nodejs
+      args:
+        creates: /usr/bin/node
+
+    - name: Install PM2 globally
+      npm:
+        name: pm2
+        global: yes
+        state: present
+
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Install git
+      apt:
+        name: git
+        state: present
+
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    # ── Optional: install PostgreSQL ──────────────────────────────────────────
+    - name: Install PostgreSQL
+      apt:
+        name: postgresql
+        state: present
+        update_cache: yes
+      when: install_db | default('false') == 'true' and db_type | default('') == 'postgres'
+
+    - name: Fix PostgreSQL auth to md5
+      shell: |
+        HBA=$(find /etc/postgresql -name pg_hba.conf | head -1)
+        if [ -n "$HBA" ]; then
+          sed -i 's/scram-sha-256/md5/g' "$HBA"
+          systemctl reload postgresql
+        fi
+      when: install_db | default('false') == 'true' and db_type | default('') == 'postgres'
+      args:
+        executable: /bin/bash
+
+    - name: Create PostgreSQL database
+      shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name | default('') }}'" \
+          | grep -q 1 || sudo -u postgres psql -c "CREATE DATABASE {{ db_name | default('') }};"
+      when:
+        - install_db | default('false') == 'true'
+        - db_type | default('') == 'postgres'
+        - db_name | default('') != ''
+      args:
+        executable: /bin/bash
+
+    - name: Create PostgreSQL user
+      shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ db_username | default('') }}'" \
+          | grep -q 1 || sudo -u postgres psql -c \
+          "CREATE USER {{ db_username | default('') }} WITH ENCRYPTED PASSWORD '{{ db_password | default('') }}';"
+      when:
+        - install_db | default('false') == 'true'
+        - db_type | default('') == 'postgres'
+        - db_username | default('') != ''
+      args:
+        executable: /bin/bash
+
+    - name: Grant PostgreSQL privileges
+      shell: |
+        sudo -u postgres psql -c \
+          "GRANT ALL PRIVILEGES ON DATABASE {{ db_name | default('') }} TO {{ db_username | default('') }};"
+      when:
+        - install_db | default('false') == 'true'
+        - db_type | default('') == 'postgres'
+        - db_name | default('') != ''
+        - db_username | default('') != ''
+      args:
+        executable: /bin/bash
+
+    # ── Deploy app files ──────────────────────────────────────────────────────
+    - name: Copy app files to server
+      copy:
+        src: ../
+        dest: "{{ app_dir }}/"
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
+
+    - name: Fix app directory ownership
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        recurse: yes
+
+    # ── Write .env file ───────────────────────────────────────────────────────
+    - name: Write .env file
+      copy:
+        dest: "{{ app_dir }}/.env"
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+        content: |
+          {% if node_env_database_url | default('') != '' %}
+          DATABASE_URL={{ node_env_database_url }}
+          {% endif %}
+          {% if node_env_mongo_uri | default('') != '' %}
+          MONGO_URI={{ node_env_mongo_uri }}
+          {% endif %}
+          {% if node_env_db_host | default('') != '' %}
+          DB_HOST={{ node_env_db_host }}
+          {% endif %}
+          {% if node_env_db_port | default('') != '' %}
+          DB_PORT={{ node_env_db_port }}
+          {% endif %}
+          {% if node_env_db_name | default('') != '' %}
+          DB_NAME={{ node_env_db_name }}
+          {% endif %}
+          {% if node_env_db_user | default('') != '' %}
+          DB_USER={{ node_env_db_user }}
+          {% endif %}
+          {% if node_env_db_password | default('') != '' %}
+          DB_PASSWORD={{ node_env_db_password }}
+          {% endif %}
+          NODE_ENV=production
+          PORT=3000
+          HOST=0.0.0.0
+
+    # ── Install npm dependencies ──────────────────────────────────────────────
+    - name: Install npm dependencies
+      npm:
+        path: "{{ app_dir }}"
+        state: present
+      become: yes
+      become_user: ubuntu
+
+    - name: Run build script if present
+      shell: |
+        if [ -f "package.json" ] && grep -q '"build"' "package.json"; then
+          npm run build
+        else
+          echo "No build script found, skipping."
+        fi
+      args:
+        chdir: "{{ app_dir }}"
+        executable: /bin/bash
+      become: yes
+      become_user: ubuntu
+
+    # ── Start app with PM2 ────────────────────────────────────────────────────
+    - name: Start app with PM2
+      shell: |
+        pm2 delete app 2>/dev/null || true
+        set -a
+        [ -f "{{ app_dir }}/.env" ] && . "{{ app_dir }}/.env"
+        export PORT="${PORT:-3000}"
+        export HOST="${HOST:-0.0.0.0}"
+        set +a
+        if [ -f "{{ app_dir }}/package.json" ] && grep -q '"start"' "{{ app_dir }}/package.json"; then
+          pm2 start npm --name app --update-env -- start
+        elif [ -f "{{ app_dir }}/server.js" ]; then
+          pm2 start "{{ app_dir }}/server.js" --name app --update-env
+        elif [ -f "{{ app_dir }}/index.js" ]; then
+          pm2 start "{{ app_dir }}/index.js" --name app --update-env
+        elif [ -f "{{ app_dir }}/app.js" ]; then
+          pm2 start "{{ app_dir }}/app.js" --name app --update-env
+        else
+          echo "No Node.js entrypoint found in {{ app_dir }}" >&2
+          exit 1
+        fi
+        pm2 save
+      args:
+        chdir: "{{ app_dir }}"
+        executable: /bin/bash
+      become: yes
+      become_user: ubuntu
+
+    # ── PM2 systemd startup (root task) ──────────────────────────────────────
+    - name: Install PM2 systemd startup service
+      shell: |
+        env PATH=$PATH:/usr/bin pm2 startup systemd -u ubuntu --hp /home/ubuntu
+      args:
+        creates: /etc/systemd/system/pm2-ubuntu.service
+
+    # ── Wait for app ──────────────────────────────────────────────────────────
+    - name: Wait for app to be reachable on port 3000
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ app_port }}"
+        delay: 10
+        timeout: 120
+        state: started
+      ignore_errors: yes
+      register: port_wait
+
+    - name: Print PM2 logs if app did not start
+      command: pm2 logs app --lines 100 --nostream
+      register: pm2_logs
+      when: port_wait is failed
+      become: yes
+      become_user: ubuntu
+      changed_when: false
+
+    - name: Show PM2 logs
+      debug:
+        msg: "{{ pm2_logs.stdout_lines | default(['No logs captured']) }}"
+      when: port_wait is failed
+
+    - name: Fail if app did not start
+      fail:
+        msg: >
+          App did not start on port {{ app_port }} within 120 seconds.
+          Check the PM2 logs above. Common causes: missing build step,
+          crashed script, or mismatched port.
+      when: port_wait is failed
+
+    # ── Configure nginx ───────────────────────────────────────────────────────
+    - name: Configure nginx reverse proxy
+      copy:
+        dest: /etc/nginx/sites-enabled/app
+        mode: '0644'
+        content: |
+          server {
+              listen 80;
+              server_name _;
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_cache_bypass $http_upgrade;
+              }
+          }
+
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Restart and enable nginx
+      service:
+        name: nginx
+        state: restarted
+        enabled: yes
+
+    # ── Report ────────────────────────────────────────────────────────────────
+    - name: Report server IP
+      debug:
+        msg: "server_ip={{ ansible_host }}"
