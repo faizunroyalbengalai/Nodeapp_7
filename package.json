@@ -1,0 +1,14 @@
+{
+  "name": "nodeapp_7",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Node.js app for Nodeapp_7",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "pg": "^8.16.3"
+  }
+}
